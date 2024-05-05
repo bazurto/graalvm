@@ -1,0 +1,7 @@
+deps = [
+    "github.com/bazurto/groovy",
+    "github.com/bazurto/gradle"
+]
+
+env =  {
+}

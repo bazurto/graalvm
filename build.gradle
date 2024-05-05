@@ -1,0 +1,265 @@
+def versions = [17, 21, 22]
+//versions.each { major -> println(major)}
+
+
+buildscript {
+    repositories {
+        mavenLocal()
+        mavenCentral()
+    }
+    dependencies {
+        classpath('com.vdurmont:semver4j:3.1.0')
+        classpath('org.kohsuke:github-api:1.123')
+
+    }
+}
+
+import com.vdurmont.semver4j.Semver;
+import org.kohsuke.github.*
+
+ext {
+    github = GitHub.connectUsingOAuth(getProp('github.token', { getProp('gh.token') }))
+    archMap = [
+            "linux-amd64": "linux-x64",
+            "linux-arm64": "linux-aarch64",
+            "darwin-amd64": "macos-x64",
+            "darwin-arm64": "macos-aarch64",
+            "windows-amd64": "windows-x64" ]
+    // https://download.oracle.com/graalvm/22/latest/graalvm-jdk-22_linux-x64_bin.tar.gz
+    // https://download.oracle.com/graalvm/22/latest/graalvm-jdk-22_linux-aarch64_bin.tar.gz
+    // https://download.oracle.com/graalvm/22/latest/graalvm-jdk-22_macos-x64_bin.tar.gz
+    // https://download.oracle.com/graalvm/22/latest/graalvm-jdk-22_macos-aarch64_bin.tar.gz
+    // https://download.oracle.com/graalvm/22/latest/graalvm-jdk-22_windows-x64_bin.zip
+    // https://download.oracle.com/graalvm/22/latest/graalvm-jdk-22_macos-x64_bin.tar.gz
+
+
+}
+
+task release() {
+    doLast { /* nothing to do*/ }
+}
+
+task buildAll() {
+    doLast { /* nothing to do*/ }
+}
+
+task clean() {
+    doLast {
+        delete buildDir
+    }
+}
+
+versions.each { major ->
+    def releaseTask = createTask("release_${major}", [], {
+        shell(cmd: "gh release delete --cleanup-tag -y v$major", throw: false)
+        shell(cmd: "git push origin :refs/tags/v$major", throw: false)
+        shell(cmd: "git tag -d v$major", throw: false)
+        //shell(cmd: "gh release create -d --generate-notes -t v$major v$major")
+        shell(cmd: "gh release create --generate-notes -t v$major v$major")
+    });
+    configure(release) { dependsOn += releaseTask.name; } // add to release task
+
+    def uploadTasksTask = tasks.create(name: _taskName("uploads_$major")) {}
+    tasks.named(releaseTask.name) { finalizedBy(uploadTasksTask.name) }
+
+
+    // for each architecture windows,linux, mac | amd64, aarch
+    archMap.each {arch, remoteArchName ->
+        def origFileExtension = "tar.gz";
+        if (arch.contains("windows")) {origFileExtension = "zip"}
+
+        def downloadUrl = "https://download.oracle.com/graalvm/${major}/latest/graalvm-jdk-${major}_${remoteArchName}_bin.$origFileExtension"
+        def downloadFileName = getFilePart(downloadUrl)
+        def downloadedAsset = "${buildDir}/downloaded/${downloadFileName}"
+
+        def assetName = "openjdk-${arch}-v${major}"
+        def assetDir = file("${buildDir}/downloaded/$assetName")
+        def assetFileName = file("${buildDir}/downloaded/${assetName}.tgz")
+
+
+        // download_asset_task ======================================================
+        def downloadAssetTask = createTask("download_asset_${arch}_${major}", [], {
+                if (!file(downloadedAsset).exists()) {
+                    shell(cmd:"mkdir -p ${buildDir}/downloaded")
+                    shell(cmd:"wget -q -O ${buildDir}/downloaded/${downloadFileName}.tmp ${downloadUrl}")
+                    shell(cmd:"mv ${buildDir}/downloaded/${downloadFileName}.tmp ${downloadedAsset}")
+                }
+        });
+
+
+        // create_asset_task ======================================================
+        def createAssetTask = createTask("create_asset_${arch}_${major}", [downloadAssetTask.name], {
+            def fileName = file(downloadedAsset)
+
+            def assetDirTmp = file("${assetDir}.tmp")
+            def isMac = false
+            if (arch.startsWith("darwin")) {
+                isMac = true
+            }
+
+            // uncompress to asset dir
+            if (!assetDir.exists()) {
+                delete assetDirTmp
+                shell(cmd:"mkdir -p $assetDirTmp")
+                if (fileName.toString().contains('.zip')) { // unzip windows
+                    shell(cmd:"unzip $fileName", dir: assetDirTmp )
+                } else {
+                    shell(cmd:"tar xfz $fileName", dir: assetDirTmp )
+                }
+                def files = assetDirTmp.listFiles()
+                def originalDirNameFromZip;
+                if (files.size() == 1) {
+                    originalDirNameFromZip = files[0]
+                } else if (files.size() > 1){
+                    originalDirNameFromZip = assetDirTmp
+                } else {
+                    throw new RuntimeException("Couldn't determine the directory name when uncompressing the file");
+                }
+
+                shell(cmd:"mv $originalDirNameFromZip $assetDir", dir:"${buildDir}/downloaded")
+                delete assetDirTmp
+
+            }
+
+            //
+            writeBzFile("$assetDir/.bz", isMac)
+            writeBzFile("$assetDir/.bz.lock", isMac)
+
+            // create asset tgz
+            if (!file(assetFileName).exists()) {
+                shell(cmd:"tar cfz ${assetFileName}.tmp .", dir: assetDir)
+                shell(cmd:"mv ${assetFileName}.tmp ${assetFileName}", dir: "${buildDir}/downloaded")
+            }
+        });
+
+        // upload_asset_task ======================================================
+        def uploadAssetTask = createTask("upload_${arch}_${major}", [createAssetTask.name], {
+            shell(cmd: "gh release upload v$major $assetFileName")
+        });
+
+
+        configure(buildAll) { dependsOn += createAssetTask.name }
+        configure(uploadAssetTask) { dependsOn += createAssetTask.name }
+        configure(uploadTasksTask) { dependsOn += uploadAssetTask.name }
+
+    } // archMap
+    
+} // versions.each
+
+
+
+def _taskName(name) {
+    return name.replace('-', '_')
+    .replace('.', '_').toLowerCase();
+}
+
+def shell(opts = [:]) {
+    if (!opts.dir) { opts.dir = project.projectDir }
+    if (!opts.env) { opts.env = System.env.entrySet().stream().map { "$it.key=$it.value"  }.collect().asList() }
+    if (!opts.containsKey("throw")) { opts.throw = true }
+    opts.dir = file(opts.dir)
+
+    println opts.cmd
+    def proc = opts.cmd.execute(opts.env, opts.dir)
+    proc.consumeProcessOutput(System.out, System.err)
+    if (proc.waitFor() != 0) {
+        if (opts.throw) {
+            throw new RuntimeException("command `$opts.cmd` returned error")
+        }
+    }
+}
+
+def writeBzFile(f, isMac) {
+    def macDir = ""
+    if (isMac) {
+        macDir = "/Contents/Home"
+    }
+
+    def m = [
+        "env": [
+            "JAVA_HOME": '${DIR}' + macDir,
+        ],
+        "binDir": '${JAVA_HOME}/bin',
+    ]
+
+
+    def builder = new groovy.json.JsonBuilder(m)
+    file(f).text = builder.toPrettyString()
+}
+
+def getFilePart(url) {
+    def parts = url.split("/")
+    return parts[parts.size() - 1]
+}
+
+
+
+
+
+def getProp(key, closure) {
+    try {
+        return getProp(key)
+    } catch (Exception e) {}
+    return closure();
+}
+
+def getProp(key) {
+    def val = null;
+
+    //
+    def propKey = toPropKey(key)
+    if (System.properties.containsKey(propKey)) {
+        return System.properties.get(propKey);
+    }
+
+    //
+    def envKey = toEnvKey(key)
+    def env = System.getenv()
+    if (env.containsKey(envKey)) {
+        return env.get(envKey);
+    }
+
+	def rhaProps = loadProps(new File(System.properties.get("user.home") + "/.rha/config.properties"))
+    if (rhaProps.containsKey(propKey)) {
+        return rhaProps.get(propKey)
+    }
+
+    throw new RuntimeException("Environment variable `$envKey` or Property `$propKey` not found");
+}
+
+def toEnvKey(str) { return str.replace('.', '_') .replace('-', '_') .toUpperCase(); }
+def toPropKey(str) { return str.replace('-', '.') .replace('_', '.') .toLowerCase(); }
+def loadProps(File file) { def props = new Properties();
+    if (file.exists()) { file.withInputStream { props.load(it ); } }
+    return props;
+}
+
+def createMetaTask(name, addToParentTask=[]) {
+    def metaTask = tasks.create(name: name) {
+        doLast {
+        }
+    }
+    configure(metaTask) {   
+        group = 'OpenJDK'
+        description = 'Meta Task'
+    }
+
+    addToParentTask.each {
+        configure(it) {dependsOn += metaTask.name}
+    }
+    return metaTask;
+}
+
+def createTask(String name, List<String>depends, Closure closure) {
+    def task = tasks.create(name: _taskName(name)) {
+        doLast {
+            closure()
+        }
+    }
+    configure(task) {   
+        group = 'Bazurto'
+        description = name
+        dependsOn = depends
+    }
+    return task;
+}

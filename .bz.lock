@@ -1,0 +1,16 @@
+{
+  "deps": [
+    {
+      "server": "github.com",
+      "owner": "bazurto",
+      "repo": "groovy",
+      "version": "4.0.21"
+    },
+    {
+      "server": "github.com",
+      "owner": "bazurto",
+      "repo": "gradle",
+      "version": "8.7"
+    }
+  ]
+}
